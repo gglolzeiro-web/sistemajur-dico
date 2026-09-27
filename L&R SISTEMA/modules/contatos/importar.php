@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/../../includes/auth.php';
+require_once __DIR__ . '/../../includes/xlsx_leitor.php';
 $usuario = exigirLogin();
 
 $pdo = getConexao();
@@ -13,27 +14,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $erro = 'Selecione um arquivo válido.';
     } else {
         $nomeOriginal = $_FILES['planilha']['name'];
+        $caminhoTemporario = $_FILES['planilha']['tmp_name'];
         $extensao = strtolower(pathinfo($nomeOriginal, PATHINFO_EXTENSION));
 
-        if ($extensao !== 'csv') {
-            $erro = 'Por enquanto, importe a planilha como .csv (no Excel: Arquivo > Salvar como > CSV UTF-8). '
-                . 'Suporte a .xlsx direto exige uma biblioteca adicional — posso adicionar depois, se você quiser.';
-        } else {
-            $linhas = 0;
-            $importados = 0;
-            $ignorados = 0;
+        try {
+            $todasLinhas = match ($extensao) {
+                'csv' => lerCsvComoLinhas($caminhoTemporario),
+                'xlsx' => lerXlsxComoLinhas($caminhoTemporario),
+                default => throw new RuntimeException('Formato não suportado. Envie um arquivo .xlsx ou .csv.'),
+            };
+        } catch (RuntimeException $e) {
+            $erro = $e->getMessage();
+            $todasLinhas = [];
+        }
 
-            if (($alca = fopen($_FILES['planilha']['tmp_name'], 'r')) !== false) {
-                $cabecalho = fgetcsv($alca, 0, ';');
-                if ($cabecalho !== false && count($cabecalho) === 1) {
-                    // Arquivo separado por vírgula em vez de ponto-e-vírgula.
-                    rewind($alca);
-                    $cabecalho = fgetcsv($alca, 0, ',');
-                    $separador = ',';
-                } else {
-                    $separador = ';';
-                }
-                $cabecalho = array_map(fn ($c) => mb_strtolower(trim($c)), $cabecalho ?: []);
+        if (!$erro) {
+            if (!$todasLinhas) {
+                $erro = 'A planilha está vazia.';
+            } else {
+                $cabecalho = array_map(fn ($c) => mb_strtolower(trim((string) $c)), array_shift($todasLinhas));
                 $indiceNome = array_search('nome', $cabecalho, true);
                 $indiceCpf = array_search('cpf_cnpj', $cabecalho, true);
                 $indiceEmail = array_search('email', $cabecalho, true);
@@ -42,13 +41,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($indiceNome === false) {
                     $erro = 'A planilha precisa ter uma coluna "nome". Colunas aceitas: nome, cpf_cnpj, email, telefone.';
                 } else {
+                    $importados = 0;
+                    $ignorados = 0;
+
                     $pdo->beginTransaction();
                     $stmtInserir = $pdo->prepare(
                         'INSERT INTO contatos (nome, cpf_cnpj, email, telefone, origem, atendente_atual_id, criado_por) VALUES (?,?,?,?,\'planilha\',?,?)'
                     );
 
-                    while (($linha = fgetcsv($alca, 0, $separador)) !== false) {
-                        $linhas++;
+                    foreach ($todasLinhas as $linha) {
                         $nome = trim($linha[$indiceNome] ?? '');
                         if ($nome === '') {
                             $ignorados++;
@@ -69,12 +70,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $pdo->commit();
                     $resultado = "Importação concluída: {$importados} contato(s) criado(s), {$ignorados} linha(s) ignorada(s) por falta de nome.";
                 }
-                fclose($alca);
-            } else {
-                $erro = 'Não foi possível ler o arquivo enviado.';
             }
         }
     }
+}
+
+/** Lê um .csv (; ou , como separador) e devolve linhas no mesmo formato do leitor de .xlsx. */
+function lerCsvComoLinhas(string $caminhoArquivo): array
+{
+    $alca = fopen($caminhoArquivo, 'r');
+    if ($alca === false) {
+        throw new RuntimeException('Não foi possível ler o arquivo enviado.');
+    }
+
+    $primeiraLinha = fgetcsv($alca, 0, ';');
+    $separador = ';';
+    if ($primeiraLinha !== false && count($primeiraLinha) === 1) {
+        rewind($alca);
+        $primeiraLinha = fgetcsv($alca, 0, ',');
+        $separador = ',';
+    }
+
+    $linhas = [];
+    if ($primeiraLinha !== false) {
+        $linhas[] = $primeiraLinha;
+    }
+    while (($linha = fgetcsv($alca, 0, $separador)) !== false) {
+        $linhas[] = $linha;
+    }
+    fclose($alca);
+
+    return $linhas;
 }
 
 $tituloPagina = 'Importar contatos';
@@ -93,16 +119,15 @@ require __DIR__ . '/../../includes/cabecalho.php';
 
 <div class="card">
     <div class="alerta alerta-info">
-        Formato aceito no momento: <strong>.csv</strong> com colunas <code>nome</code> (obrigatória),
-        <code>cpf_cnpj</code>, <code>email</code>, <code>telefone</code>. No Excel, use
-        "Arquivo &gt; Salvar como &gt; CSV UTF-8 (separado por vírgulas)". Se preferir enviar o .xlsx original
-        direto, dá para adicionar isso depois com uma biblioteca de planilha — me avise se quiser.
+        Formatos aceitos: <strong>.xlsx</strong> (Excel) ou <strong>.csv</strong>, com colunas
+        <code>nome</code> (obrigatória), <code>cpf_cnpj</code>, <code>email</code>, <code>telefone</code>
+        na primeira linha.
     </div>
     <form method="post" enctype="multipart/form-data" style="margin-top: 16px;">
         <?= csrfCampo() ?>
         <div class="campo">
-            <label>Arquivo .csv</label>
-            <input type="file" name="planilha" accept=".csv" required>
+            <label>Arquivo .xlsx ou .csv</label>
+            <input type="file" name="planilha" accept=".xlsx,.csv" required>
         </div>
         <button type="submit" class="botao botao-primario" style="margin-top: 16px;"><?= icone('upload') ?> Importar</button>
     </form>
